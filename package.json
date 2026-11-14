@@ -1,0 +1,18 @@
+{
+  "name": "pixel-battle",
+  "version": "1.0.0",
+  "description": "CSSD 315 Pixel Battle - shared canvas server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "loadtest": "node tools/loadtest.js"
+  },
+  "dependencies": {
+    "pg": "^8.23.1",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
