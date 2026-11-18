@@ -8,6 +8,7 @@
  *   PB.COLOURS                       RGB triples from palette.js (HSB-designed palette)
  *   PB.send(msg)                     send a raw message to the server
  *   PB.onReplay                      set to a function(msg) to receive replay chunks
+ *   PB.onNewGame                     set to a function() called when anyone starts a new game
  */
 (() => {
   "use strict";
@@ -58,6 +59,7 @@
 
   // ---------- state ----------
   let ws = null, me = null, cooldownMs = 5000, nextAllowedAt = 0, retry = 500;
+  let helloSent = false, teamSizes = [0, 0, 0, 0], newGameNotice = false;
   const $ = id => document.getElementById(id);
   const status = msg => { $("status").textContent = msg; };
 
@@ -67,9 +69,11 @@
     ws = new WebSocket(`${proto}//${location.host}`);
     ws.onopen = () => {
       retry = 500;
-      let saved = null;
-      try { saved = localStorage.getItem("pb-player"); } catch (_) {}
-      ws.send(JSON.stringify({ type: "hello", playerId: saved }));
+      helloSent = false;
+      let saved = null, savedTeam = null;
+      try { saved = localStorage.getItem("pb-player"); savedTeam = parseInt(localStorage.getItem("pb-team"), 10); } catch (_) {}
+      if (saved) hello(saved, Number.isInteger(savedTeam) ? savedTeam : undefined);   // returning player: keeps their team
+      else showPicker();                                                              // first join: choose a team
     };
     ws.onmessage = e => handle(JSON.parse(e.data));
     ws.onclose = () => {
@@ -80,16 +84,39 @@
   }
   const send = msg => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); };
 
+  // ---------- team picker (first join only) ----------
+  function hello(playerId, team) {
+    if (helloSent) return;
+    helloSent = true;
+    send({ type: "hello", playerId: playerId || null, team });
+  }
+  function showPicker() {
+    const box = $("teamBtns");
+    box.innerHTML = "";
+    TEAM_NAMES.forEach((name, t) => {
+      const b = document.createElement("button");
+      b.className = "teamBtn";
+      b.innerHTML = `<i style="background:rgb(${COLOURS[TEAM_BASE + t].join(",")})"></i>${name}<span>${teamSizes[t]} player${teamSizes[t] === 1 ? "" : "s"}</span>`;
+      b.onclick = () => { $("picker").hidden = true; hello(null, t); };
+      box.appendChild(b);
+    });
+    $("autoTeam").onclick = () => { $("picker").hidden = true; hello(null, undefined); };
+    $("picker").hidden = false;
+  }
+
   function handle(m) {
     if (m.type === "init") {
       me = m.you;
-      try { localStorage.setItem("pb-player", me.id); } catch (_) {}
+      $("picker").hidden = true;
+      try { localStorage.setItem("pb-player", me.id); localStorage.setItem("pb-team", String(me.team)); } catch (_) {}
       cooldownMs = m.cooldownMs;
       nextAllowedAt = Date.now() + m.retryInMs;
       const bin = atob(m.canvas);
       for (let i = 0; i < bin.length; i++) setPixel(i % W, (i / W) | 0, bin.charCodeAt(i));
       if (colour < TEAM_BASE) selectColour(TEAM_BASE + me.team);
-      status(`Connected. You are team ${TEAM_NAMES[me.team]}.`);
+      status(newGameNotice ? `A new game was started. The canvas is clear. You are team ${TEAM_NAMES[me.team]}.`
+                           : `Connected. You are team ${TEAM_NAMES[me.team]}.`);
+      newGameNotice = false;
       drawScores(m.scores, m.online);
     } else if (m.type === "action") {
       for (let i = 0; i < m.pixels.length; i += 2) setPixel(m.pixels[i], m.pixels[i + 1], m.colour);
@@ -97,11 +124,20 @@
     } else if (m.type === "undo") {
       for (let i = 0; i < m.pixels.length; i += 2) setPixel(m.pixels[i], m.pixels[i + 1], m.colours[i / 2]);
       if (me && m.player === me.id) status("Undid your last action.");
+    } else if (m.type === "teams") {
+      teamSizes = m.sizes;
+      if (!$("picker").hidden) showPicker();
+    } else if (m.type === "newgame") {
+      picked = [];
+      if (PB.onNewGame) PB.onNewGame();
+      newGameNotice = true;       // shown by the init message that follows
     } else if (m.type === "score") {
       drawScores(m.scores, m.online);
     } else if (m.type === "rejected") {
-      if (m.retryInMs) nextAllowedAt = Date.now() + m.retryInMs;
-      status(`Rejected: ${m.reason}`);
+      if (m.retryInMs && m.reason === "cooldown") nextAllowedAt = Date.now() + m.retryInMs;   // only drawing cooldowns block drawing
+      status(m.reason === "a new game was started recently"
+        ? `A new game was started recently. Try again in ${Math.ceil(m.retryInMs / 1000)}s.`
+        : `Rejected: ${m.reason}`);
     } else if (m.type === "replay" && PB.onReplay) {
       PB.onReplay(m);
     }
@@ -134,6 +170,11 @@
     send({ type: "action", tool: toolName, colour, pixels });
   }
   $("undo").onclick = () => send({ type: "undo" });
+  $("newGame").onclick = () => {
+    if (confirm("Start a new game?\n\nThis clears the canvas and the whole history for EVERY player. It cannot be undone.")) {
+      send({ type: "newgame", confirm: true });
+    }
+  };
 
   // PNG export: the board buffer is 128x128, saved at that original size.
   function download(blob, name) {
@@ -191,6 +232,6 @@
   }, 100);
 
   buildPalette(); buildTools(); selectColour(0);
-  const PB = window.PB = { setPixel, getPixel, TOOLS, COLOURS, send, place, download, onReplay: null, rebuildTools: buildTools };
+  const PB = window.PB = { setPixel, getPixel, TOOLS, COLOURS, send, place, download, onReplay: null, onNewGame: null, rebuildTools: buildTools };
   connect();
 })();

@@ -111,6 +111,11 @@
     open();
   };
 
+  PB.onNewGame = () => {                              // old history is gone: close any open replay
+    actions = []; collecting = false;
+    if (isOpen) close();
+  };
+
   $("replayBtn").onclick = () => {
     if (isOpen) return;
     actions = []; collecting = true;

@@ -4,7 +4,13 @@
  * PROTOCOL (all messages are JSON)
  *
  * Client -> Server
- *   {type:"hello", playerId?:string}      first message; reuse a saved playerId to keep team and cooldown
+ *   {type:"hello", playerId?:string, team?:0..3}
+ *                                         first message; reuse a saved playerId to keep team and cooldown.
+ *                                         team = the team the player picked. Only used the first time (when the
+ *                                         server does not already know this player); a returning player keeps
+ *                                         their team. Without a valid team, the smallest team is assigned.
+ *   {type:"newgame", confirm:true}        wipe the canvas and the whole history (any player; rate limited).
+ *                                         Teams are kept. The client must show its own "are you sure?" prompt.
  *   {type:"action", tool, colour, pixels} tool: pen|line|circle|polygon|fill
  *                                         colour: integer 0..19 (0-15 palette, 16-19 team colours)
  *                                         pixels: flat array [x0,y0,x1,y1,...] computed by the client's own tools
@@ -13,6 +19,8 @@
  *   {type:"replay"}                       request the full action log
  *
  * Server -> Client
+ *   {type:"teams", sizes:[n0,n1,n2,n3]}   sent on connect, before hello, so the client can show the team picker
+ *   {type:"newgame", t}                   the game was reset; an "init" with the blank canvas follows
  *   {type:"init", you:{id,team}, width, height, blank, canvas(base64), scores, online, cooldownMs, retryInMs}
  *   {type:"action", id, t, player, team, tool, colour, pixels}   broadcast to everyone, sender included
  *   {type:"undo", id, t, player, team, target, pixels, colours}   pixels [x,y,...] with one restored colour each
@@ -36,6 +44,9 @@ const MAX_PIXELS_PER_ACTION = WIDTH * HEIGHT;
 const TOOLS = new Set(["pen", "line", "circle", "polygon", "fill"]);
 const LOG_FILE = path.join(__dirname, "actions.jsonl");
 const REPLAY_CHUNK = 200;
+const NEWGAME_COOLDOWN_MS = Number(process.env.NEWGAME_COOLDOWN_MS) || 30000;  // min gap between resets (global)
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const validTeam = (t) => Number.isInteger(t) && t >= 0 && t < NUM_TEAMS;
 
 // ---------- state ----------
 const canvas = new Uint8Array(WIDTH * HEIGHT).fill(BLANK);
@@ -44,6 +55,7 @@ const actionLog = [];
 const players = new Map();       // playerId -> {id, team, lastActionAt}
 const teamSizes = new Array(NUM_TEAMS).fill(0);
 let nextActionId = 1;
+let lastNewGameAt = 0;
 
 function setPx(idx, colour) {
   const old = canvas[idx];
@@ -75,6 +87,12 @@ function restore(entry) {
   applyAction(entry);
   actionLog.push(entry);
   nextActionId = Math.max(nextActionId, entry.id + 1);
+  // rebuild the player list (team + cooldown) from the log
+  if (entry.player && validTeam(entry.team)) {
+    let p = players.get(entry.player);
+    if (!p) { p = { id: entry.player, team: entry.team, lastActionAt: 0 }; players.set(p.id, p); teamSizes[p.team]++; }
+    if (entry.tool !== "undo") p.lastActionAt = Math.max(p.lastActionAt, entry.t || 0);
+  }
 }
 
 async function loadHistory() {
@@ -98,12 +116,26 @@ async function loadHistory() {
   }
 }
 
+// Database writes go through one queue so that a wipe can never overtake (or be overtaken by) earlier inserts.
+let dbQueue = Promise.resolve();
 function persist(entry) {
   if (pool) {
-    pool.query("INSERT INTO entries (id, data) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING", [entry.id, JSON.stringify(entry)])
+    dbQueue = dbQueue
+      .then(() => pool.query("INSERT INTO entries (id, data) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING", [entry.id, JSON.stringify(entry)]))
       .catch(err => console.error("Failed to store action", entry.id, err.message));
   } else {
     logStream.write(JSON.stringify(entry) + "\n");
+  }
+}
+function wipeStorage() {
+  if (pool) {
+    dbQueue = dbQueue
+      .then(() => pool.query("DELETE FROM entries"))
+      .catch(err => console.error("Failed to wipe stored history", err.message));
+  } else {
+    logStream.end();
+    fs.writeFileSync(LOG_FILE, "");
+    logStream = fs.createWriteStream(LOG_FILE, { flags: "a" });
   }
 }
 
@@ -129,14 +161,39 @@ const send = (ws, obj) => { if (ws.readyState === 1) ws.send(JSON.stringify(obj)
 const broadcast = (obj) => { const s = JSON.stringify(obj); for (const c of wss.clients) if (c.readyState === 1) c.send(s); };
 const online = () => wss.clients.size;
 
-function getPlayer(requestedId) {
+// Known player (same id) -> keep their team. New player -> the team they picked, or the smallest team if none given.
+function getPlayer(requestedId, requestedTeam) {
   if (requestedId && players.has(requestedId)) return players.get(requestedId);
   let team = 0;
-  for (let t = 1; t < NUM_TEAMS; t++) if (teamSizes[t] < teamSizes[team]) team = t;
+  if (validTeam(requestedTeam)) team = requestedTeam;
+  else for (let t = 1; t < NUM_TEAMS; t++) if (teamSizes[t] < teamSizes[team]) team = t;
   teamSizes[team]++;
-  const p = { id: crypto.randomUUID(), team, lastActionAt: 0 };
+  // keep the client's saved id (e.g. after a server restart) so old actions still belong to them
+  const id = typeof requestedId === "string" && UUID_RE.test(requestedId) ? requestedId : crypto.randomUUID();
+  const p = { id, team, lastActionAt: 0 };
   players.set(p.id, p);
   return p;
+}
+
+function sendInit(ws) {
+  const retryInMs = Math.max(0, ws.player.lastActionAt + COOLDOWN_MS - Date.now());
+  send(ws, { type: "init", you: { id: ws.player.id, team: ws.player.team },
+    width: WIDTH, height: HEIGHT, blank: BLANK,
+    canvas: Buffer.from(canvas).toString("base64"),
+    scores: scores(), online: online(), cooldownMs: COOLDOWN_MS, retryInMs });
+}
+
+function newGame() {
+  canvas.fill(BLANK);
+  counts.fill(0);
+  actionLog.length = 0;
+  nextActionId = 1;
+  for (const p of players.values()) { p.last = null; p.lastActionAt = 0; }   // teams are kept
+  wipeStorage();
+  lastNewGameAt = Date.now();
+  broadcast({ type: "newgame", t: lastNewGameAt });
+  for (const c of wss.clients) if (c.player) sendInit(c);
+  broadcast({ type: "score", scores: scores(), online: online() });
 }
 
 function validate(msg) {
@@ -155,6 +212,7 @@ wss.on("connection", (ws) => {
   ws.isAlive = true;
   ws.player = null;
   ws.on("pong", () => { ws.isAlive = true; });
+  send(ws, { type: "teams", sizes: teamSizes.slice() });
 
   ws.on("message", (raw) => {
     let msg;
@@ -163,12 +221,8 @@ wss.on("connection", (ws) => {
 
     if (msg.type === "hello") {
       if (ws.player) return;
-      ws.player = getPlayer(typeof msg.playerId === "string" ? msg.playerId : null);
-      const retryInMs = Math.max(0, ws.player.lastActionAt + COOLDOWN_MS - Date.now());
-      send(ws, { type: "init", you: { id: ws.player.id, team: ws.player.team },
-        width: WIDTH, height: HEIGHT, blank: BLANK,
-        canvas: Buffer.from(canvas).toString("base64"),
-        scores: scores(), online: online(), cooldownMs: COOLDOWN_MS, retryInMs });
+      ws.player = getPlayer(typeof msg.playerId === "string" ? msg.playerId : null, msg.team);
+      sendInit(ws);
       broadcast({ type: "score", scores: scores(), online: online() });
       return;
     }
@@ -214,6 +268,13 @@ wss.on("connection", (ws) => {
       broadcast({ type: "undo", ...entry });
       scoreDirty = true;
       return;
+    }
+
+    if (msg.type === "newgame") {
+      if (msg.confirm !== true) return send(ws, { type: "rejected", reason: "new game needs confirmation" });
+      const wait = lastNewGameAt + NEWGAME_COOLDOWN_MS - Date.now();
+      if (wait > 0) return send(ws, { type: "rejected", reason: "a new game was started recently", retryInMs: wait });
+      return newGame();
     }
 
     if (msg.type === "replay") {
