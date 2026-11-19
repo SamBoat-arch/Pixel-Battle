@@ -39,10 +39,28 @@
   const getPixel = (x, y) => (x < 0 || y < 0 || x >= W || y >= H) ? -1 : grid[y * W + x];
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) setPixel(x, y, BLANK);
 
-  (function loop() {
-    if (dirty) { ctx.putImageData(img, 0, 0); dirty = false; }
+  // Live preview of the points picked so far (drawn on top of the board with "difference" so it shows on any colour).
+  // It is redrawn every time the picked points change and is never written to the grid.
+  let lastSig = "";
+  function drawPreview() {
+    if (!picked.length) return;
+    ctx.save();
+    ctx.globalCompositeOperation = "difference";
+    ctx.fillStyle = "#ffffff";
+    for (let i = 1; i < picked.length; i++) {                       // lines joining the points (polygon outline so far)
+      const l = R.line(picked[i - 1].x, picked[i - 1].y, picked[i].x, picked[i].y);
+      for (let j = 0; j < l.length; j += 2) ctx.fillRect(l[j], l[j + 1], 1, 1);
+    }
+    for (const p of picked) ctx.fillRect(p.x, p.y, 1, 1);           // the points themselves
+    ctx.restore();
+  }
+  function loop() {
+    const sig = picked.map(p => p.x + "," + p.y).join(";");
+    if (sig !== lastSig) { lastSig = sig; dirty = true; }
+    if (dirty) { ctx.putImageData(img, 0, 0); drawPreview(); dirty = false; }
     requestAnimationFrame(loop);
-  })();
+  }
+  requestAnimationFrame(loop);
 
   // ---------- tools ----------
   // A tool collects `points` clicks (polygon: any number, ended by Finish), then make(points)
@@ -59,7 +77,8 @@
 
   // ---------- state ----------
   let ws = null, me = null, cooldownMs = 5000, nextAllowedAt = 0, retry = 500;
-  let helloSent = false, teamSizes = [0, 0, 0, 0], newGameNotice = false;
+  let helloSent = false, decided = false, gameId = null, teamSizes = [0, 0, 0, 0], newGameNotice = false;
+  let pendingAction = false, prevAllowedAt = 0;
   const $ = id => document.getElementById(id);
   const status = msg => { $("status").textContent = msg; };
 
@@ -69,11 +88,8 @@
     ws = new WebSocket(`${proto}//${location.host}`);
     ws.onopen = () => {
       retry = 500;
-      helloSent = false;
-      let saved = null, savedTeam = null;
-      try { saved = localStorage.getItem("pb-player"); savedTeam = parseInt(localStorage.getItem("pb-team"), 10); } catch (_) {}
-      if (saved) hello(saved, Number.isInteger(savedTeam) ? savedTeam : undefined);   // returning player: keeps their team
-      else showPicker();                                                              // first join: choose a team
+      helloSent = false; decided = false;
+      setTimeout(decide, 1500);        // fallback if the server never sends "teams" (older server)
     };
     ws.onmessage = e => handle(JSON.parse(e.data));
     ws.onclose = () => {
@@ -84,11 +100,25 @@
   }
   const send = msg => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); };
 
-  // ---------- team picker (first join only) ----------
+  // ---------- team picker (once per game: first join, and again after every new game) ----------
+  function saved() {
+    try {
+      const t = parseInt(localStorage.getItem("pb-team"), 10);
+      return { id: localStorage.getItem("pb-player"), team: Number.isInteger(t) ? t : undefined, game: localStorage.getItem("pb-game") };
+    } catch (_) { return { id: null, team: undefined, game: null }; }
+  }
+  // After "teams" arrives: a player already in THIS game rejoins with their team; anyone else picks a team.
+  function decide() {
+    if (decided) return;
+    decided = true;
+    const s = saved();
+    const sameGame = s.id && (gameId == null || s.game === gameId || (s.game === null && gameId === "0"));
+    if (sameGame) hello(s.id, s.team); else showPicker();
+  }
   function hello(playerId, team) {
     if (helloSent) return;
     helloSent = true;
-    send({ type: "hello", playerId: playerId || null, team });
+    send({ type: "hello", playerId: playerId || null, team, game: gameId == null ? undefined : gameId });
   }
   function showPicker() {
     const box = $("teamBtns");
@@ -97,10 +127,10 @@
       const b = document.createElement("button");
       b.className = "teamBtn";
       b.innerHTML = `<i style="background:rgb(${COLOURS[TEAM_BASE + t].join(",")})"></i>${name}<span>${teamSizes[t]} player${teamSizes[t] === 1 ? "" : "s"}</span>`;
-      b.onclick = () => { $("picker").hidden = true; hello(null, t); };
+      b.onclick = () => { $("picker").hidden = true; hello(saved().id, t); };
       box.appendChild(b);
     });
-    $("autoTeam").onclick = () => { $("picker").hidden = true; hello(null, undefined); };
+    $("autoTeam").onclick = () => { $("picker").hidden = true; hello(saved().id, undefined); };
     $("picker").hidden = false;
   }
 
@@ -108,33 +138,46 @@
     if (m.type === "init") {
       me = m.you;
       $("picker").hidden = true;
-      try { localStorage.setItem("pb-player", me.id); localStorage.setItem("pb-team", String(me.team)); } catch (_) {}
+      if (m.gameId !== undefined) gameId = m.gameId;
+      try {
+        localStorage.setItem("pb-player", me.id); localStorage.setItem("pb-team", String(me.team));
+        if (gameId != null) localStorage.setItem("pb-game", gameId);
+      } catch (_) {}
       cooldownMs = m.cooldownMs;
       nextAllowedAt = Date.now() + m.retryInMs;
       const bin = atob(m.canvas);
       for (let i = 0; i < bin.length; i++) setPixel(i % W, (i / W) | 0, bin.charCodeAt(i));
-      if (colour < TEAM_BASE) selectColour(TEAM_BASE + me.team);
+      if (colour < TEAM_BASE || newGameNotice) selectColour(TEAM_BASE + me.team);
       status(newGameNotice ? `A new game was started. The canvas is clear. You are team ${TEAM_NAMES[me.team]}.`
                            : `Connected. You are team ${TEAM_NAMES[me.team]}.`);
       newGameNotice = false;
       drawScores(m.scores, m.online);
     } else if (m.type === "action") {
       for (let i = 0; i < m.pixels.length; i += 2) setPixel(m.pixels[i], m.pixels[i + 1], m.colour);
-      if (me && m.player === me.id) nextAllowedAt = Date.now() + cooldownMs;
+      if (me && m.player === me.id) { nextAllowedAt = Date.now() + cooldownMs; pendingAction = false; }
     } else if (m.type === "undo") {
       for (let i = 0; i < m.pixels.length; i += 2) setPixel(m.pixels[i], m.pixels[i + 1], m.colours[i / 2]);
       if (me && m.player === me.id) status("Undid your last action.");
     } else if (m.type === "teams") {
       teamSizes = m.sizes;
-      if (!$("picker").hidden) showPicker();
+      if (m.gameId !== undefined) gameId = m.gameId;
+      if (!decided) decide();
+      else if (!$("picker").hidden) showPicker();               // refresh the sizes while the picker is open
     } else if (m.type === "newgame") {
-      picked = [];
+      picked = []; me = null;
+      gameId = m.gameId; teamSizes = m.sizes || teamSizes;
+      for (let i = 0; i < W * H; i++) setPixel(i % W, (i / W) | 0, BLANK);   // clear the board at once
       if (PB.onNewGame) PB.onNewGame();
-      newGameNotice = true;       // shown by the init message that follows
+      newGameNotice = true;       // shown by the init message that follows the team pick
+      helloSent = false; decided = true;
+      status("A new game was started. Choose your team.");
+      showPicker();
     } else if (m.type === "score") {
       drawScores(m.scores, m.online);
     } else if (m.type === "rejected") {
       if (m.retryInMs && m.reason === "cooldown") nextAllowedAt = Date.now() + m.retryInMs;   // only drawing cooldowns block drawing
+      else if (pendingAction && m.reason !== "a new game was started recently") nextAllowedAt = prevAllowedAt;  // refused for another reason: no cooldown used
+      pendingAction = false;
       status(m.reason === "a new game was started recently"
         ? `A new game was started recently. Try again in ${Math.ceil(m.retryInMs / 1000)}s.`
         : `Rejected: ${m.reason}`);
@@ -151,6 +194,16 @@
     const y = Math.floor((clientY - r.top) / r.height * H);
     if (x < 0 || y < 0 || x >= W || y >= H) return;
     const tool = TOOLS[toolName];
+    if (picked.length === 0 && tool.points !== Infinity && Date.now() < nextAllowedAt) {
+      status(`Cooling down. Wait ${Math.ceil((nextAllowedAt - Date.now()) / 1000)}s for the bar to fill, then start your shape.`);
+      return;
+    }
+    const prev = picked[picked.length - 1];
+    if (prev && prev.x === x && prev.y === y) {            // a double tap lands on the same cell twice
+      status(tool.points === Infinity ? "That point is already added. Tap a different spot."
+                                      : "Tap a different spot for the next point (a double tap does not work here).");
+      return;
+    }
     picked.push({ x, y });
     if (picked.length < tool.points) {
       status(tool.points === Infinity ? `${picked.length} point(s) added. Press Finish when done.`
@@ -163,10 +216,18 @@
   function submit() {
     const tool = TOOLS[toolName];
     if (picked.length < (tool.minPoints || tool.points)) { status(`Need at least ${tool.minPoints || tool.points} points`); return; }
-    if (Date.now() < nextAllowedAt) { status("Cooling down. Your points are kept."); return; }
+    if (Date.now() < nextAllowedAt) {
+      const secs = Math.ceil((nextAllowedAt - Date.now()) / 1000);
+      if (tool.points === Infinity) status(`Cooling down (${secs}s). Your points are kept. Press Finish again when the bar is full.`);
+      else { picked = []; status(`Cooling down (${secs}s). Your shape was not drawn. Try again when the bar is full.`); }
+      return;
+    }
     const pixels = tool.make(picked);
     picked = [];
     if (pixels.length === 0) { status("Nothing to draw there"); return; }
+    prevAllowedAt = nextAllowedAt;
+    nextAllowedAt = Date.now() + cooldownMs;               // start the cooldown now; the server's answer corrects it if needed
+    pendingAction = true;
     send({ type: "action", tool: toolName, colour, pixels });
   }
   $("undo").onclick = () => send({ type: "undo" });
@@ -184,8 +245,11 @@
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
-  $("savePng").onclick = () => requestAnimationFrame(() =>      // wait one frame so the latest pixels are flushed
-    canvas.toBlob(b => b ? download(b, "pixel-battle.png") : status("PNG export failed"), "image/png"));
+  $("savePng").onclick = () => requestAnimationFrame(() => {    // wait one frame so the latest pixels are flushed
+    ctx.putImageData(img, 0, 0);                                // clean frame: no preview markers in the saved image
+    canvas.toBlob(b => b ? download(b, "pixel-battle.png") : status("PNG export failed"), "image/png");
+    dirty = true;                                               // redraw the preview on the next frame
+  });
   $("finish").onclick = submit;
   $("cancel").onclick = () => { picked = []; status("Cancelled"); };
 

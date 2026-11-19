@@ -9,8 +9,10 @@
  *                                         team = the team the player picked. Only used the first time (when the
  *                                         server does not already know this player); a returning player keeps
  *                                         their team. Without a valid team, the smallest team is assigned.
- *   {type:"newgame", confirm:true}        wipe the canvas and the whole history (any player; rate limited).
- *                                         Teams are kept. The client must show its own "are you sure?" prompt.
+ *   {type:"newgame", confirm:true}        wipe the canvas, the whole history and ALL teams (any player; rate
+ *                                         limited). Every player must pick a team again. The client must show its
+ *                                         own "are you sure?" prompt.
+ *   hello also carries game:string        the gameId the client was told in "teams"/"init"; a stale one is refused
  *   {type:"action", tool, colour, pixels} tool: pen|line|circle|polygon|fill
  *                                         colour: integer 0..19 (0-15 palette, 16-19 team colours)
  *                                         pixels: flat array [x0,y0,x1,y1,...] computed by the client's own tools
@@ -19,8 +21,9 @@
  *   {type:"replay"}                       request the full action log
  *
  * Server -> Client
- *   {type:"teams", sizes:[n0,n1,n2,n3]}   sent on connect, before hello, so the client can show the team picker
- *   {type:"newgame", t}                   the game was reset; an "init" with the blank canvas follows
+ *   {type:"teams", sizes, gameId}         sent on connect (before hello) and whenever someone joins, so the client
+ *                                         can show the team picker with live sizes
+ *   {type:"newgame", t, gameId, sizes}    the game was reset: clear the board, everyone picks a team again, then hello
  *   {type:"init", you:{id,team}, width, height, blank, canvas(base64), scores, online, cooldownMs, retryInMs}
  *   {type:"action", id, t, player, team, tool, colour, pixels}   broadcast to everyone, sender included
  *   {type:"undo", id, t, player, team, target, pixels, colours}   pixels [x,y,...] with one restored colour each
@@ -56,6 +59,7 @@ const players = new Map();       // playerId -> {id, team, lastActionAt}
 const teamSizes = new Array(NUM_TEAMS).fill(0);
 let nextActionId = 1;
 let lastNewGameAt = 0;
+let gameId = "0";                // changes on every new game; "0" for a game that began before new-game existed
 
 function setPx(idx, colour) {
   const old = canvas[idx];
@@ -84,6 +88,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 let pool = null, logStream = null;
 
 function restore(entry) {
+  if (entry.tool === "newgame") gameId = String(entry.t);   // marker entry written at the start of each new game
   applyAction(entry);
   actionLog.push(entry);
   nextActionId = Math.max(nextActionId, entry.id + 1);
@@ -175,9 +180,11 @@ function getPlayer(requestedId, requestedTeam) {
   return p;
 }
 
+const teamsMsg = () => ({ type: "teams", sizes: teamSizes.slice(), gameId });
+
 function sendInit(ws) {
   const retryInMs = Math.max(0, ws.player.lastActionAt + COOLDOWN_MS - Date.now());
-  send(ws, { type: "init", you: { id: ws.player.id, team: ws.player.team },
+  send(ws, { type: "init", gameId, you: { id: ws.player.id, team: ws.player.team },
     width: WIDTH, height: HEIGHT, blank: BLANK,
     canvas: Buffer.from(canvas).toString("base64"),
     scores: scores(), online: online(), cooldownMs: COOLDOWN_MS, retryInMs });
@@ -188,11 +195,17 @@ function newGame() {
   counts.fill(0);
   actionLog.length = 0;
   nextActionId = 1;
-  for (const p of players.values()) { p.last = null; p.lastActionAt = 0; }   // teams are kept
+  players.clear();                                  // every player picks a team again
+  teamSizes.fill(0);
+  for (const c of wss.clients) c.player = null;
   wipeStorage();
-  lastNewGameAt = Date.now();
-  broadcast({ type: "newgame", t: lastNewGameAt });
-  for (const c of wss.clients) if (c.player) sendInit(c);
+  // the first entry of the new log marks the game, so the game id survives a restart
+  const marker = { id: nextActionId++, t: Date.now(), player: null, team: null, tool: "newgame", colour: 0, pixels: [] };
+  actionLog.push(marker);
+  persist(marker);
+  gameId = String(marker.t);
+  lastNewGameAt = marker.t;
+  broadcast({ type: "newgame", t: marker.t, gameId, sizes: teamSizes.slice() });
   broadcast({ type: "score", scores: scores(), online: online() });
 }
 
@@ -212,7 +225,7 @@ wss.on("connection", (ws) => {
   ws.isAlive = true;
   ws.player = null;
   ws.on("pong", () => { ws.isAlive = true; });
-  send(ws, { type: "teams", sizes: teamSizes.slice() });
+  send(ws, teamsMsg());
 
   ws.on("message", (raw) => {
     let msg;
@@ -221,9 +234,11 @@ wss.on("connection", (ws) => {
 
     if (msg.type === "hello") {
       if (ws.player) return;
+      if (msg.game !== undefined && String(msg.game) !== gameId) return send(ws, teamsMsg());   // stale: pick again
       ws.player = getPlayer(typeof msg.playerId === "string" ? msg.playerId : null, msg.team);
       sendInit(ws);
       broadcast({ type: "score", scores: scores(), online: online() });
+      broadcast(teamsMsg());                          // keeps open team pickers up to date
       return;
     }
 
@@ -278,10 +293,11 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.type === "replay") {
-      for (let i = 0; i < actionLog.length; i += REPLAY_CHUNK) {
-        send(ws, { type: "replay", actions: actionLog.slice(i, i + REPLAY_CHUNK), done: i + REPLAY_CHUNK >= actionLog.length });
+      const log = actionLog.filter(a => a.tool !== "newgame");
+      for (let i = 0; i < log.length; i += REPLAY_CHUNK) {
+        send(ws, { type: "replay", actions: log.slice(i, i + REPLAY_CHUNK), done: i + REPLAY_CHUNK >= log.length });
       }
-      if (actionLog.length === 0) send(ws, { type: "replay", actions: [], done: true });
+      if (log.length === 0) send(ws, { type: "replay", actions: [], done: true });
     }
   });
 
